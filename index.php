@@ -5,53 +5,112 @@
  */
 
 $configPath = __DIR__ . '/config.php';
-$isConfigured = file_exists($configPath);
-$cfg = $isConfigured ? require $configPath : [
-    'www_root'     => 'C:\\laragon\\www',
-    'vscode_exe'   => '',
-    'ngrok_exe'    => '',
+$defaults = [
+    'www_root' => 'C:\\laragon\\www',
+    'vscode_exe' => '',
+    'ngrok_exe' => '',
     'ngrok_config' => '',
-    'ngrok_url'    => '',
+    'ngrok_url' => '',
 ];
-
-// Handle Save Config (Wizard/Settings)
-if (isset($_POST['save_config'])) {
-    header('Content-Type: application/json');
-    $newCfg = [
-        'www_root'     => $_POST['www_root'] ?? 'C:\\laragon\\www',
-        'vscode_exe'   => $_POST['vscode_exe'] ?? '',
-        'ngrok_exe'    => $_POST['ngrok_exe'] ?? '',
-        'ngrok_config' => $_POST['ngrok_config'] ?? '',
-        'ngrok_url'    => $_POST['ngrok_url'] ?? '',
-    ];
-    $content = "<?php\nreturn " . var_export($newCfg, true) . ";";
-    if (file_put_contents($configPath, $content)) {
-        echo json_encode(['success' => true]);
-    } else {
-        echo json_encode(['success' => false, 'message' => 'Gagal menulis file config.php. Pastikan folder memiliki izin tulis.']);
+$cfg = $defaults;
+if (file_exists($configPath)) {
+    $loaded = require $configPath;
+    if (is_array($loaded)) {
+        $cfg = array_merge($defaults, $loaded);
     }
+}
+$isConfigured = file_exists($configPath);
+
+function jsonResponse(array $data): void {
+    header('Content-Type: application/json; charset=UTF-8');
+    echo json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-// Auto-detect helpers for Wizard
-function autoDetectPath($command) {
-    $out = [];
-    exec("where $command 2>nul", $out);
-    return !empty($out) ? trim($out[0]) : '';
+function normalizeWinPath($path) {
+    $path = trim((string) $path);
+    return $path === '' ? '' : str_replace('/', '\\', $path);
 }
 
-if (!$isConfigured) {
-    $cfg['vscode_exe'] = $cfg['vscode_exe'] ?: autoDetectPath('code');
-    $cfg['ngrok_exe'] = $cfg['ngrok_exe'] ?: autoDetectPath('ngrok');
-    if (empty($cfg['ngrok_config']) && getenv('LOCALAPPDATA')) {
-        $possible = getenv('LOCALAPPDATA') . '\ngrok\ngrok.yml';
-        if (file_exists($possible)) $cfg['ngrok_config'] = $possible;
+function autoDetectPath(array $candidates) {
+    foreach ($candidates as $candidate) {
+        $candidate = trim($candidate);
+        if ($candidate === '') continue;
+        if (is_file($candidate)) return $candidate;
     }
+    foreach (['where code', 'where ngrok'] as $probe) {
+        $out = [];
+        @exec($probe . ' 2>nul', $out);
+        if (!empty($out)) {
+            foreach ($out as $line) {
+                $line = trim($line);
+                if ($line !== '' && is_file($line)) return $line;
+            }
+        }
+    }
+    return '';
 }
 
-// Global Variables from Config
+function buildConfigPayload(array $source): array {
+    return [
+        'www_root' => normalizeWinPath($source['www_root'] ?? 'C:\\laragon\\www'),
+        'vscode_exe' => normalizeWinPath($source['vscode_exe'] ?? ''),
+        'ngrok_exe' => normalizeWinPath($source['ngrok_exe'] ?? ''),
+        'ngrok_config' => normalizeWinPath($source['ngrok_config'] ?? ''),
+        'ngrok_url' => trim((string) ($source['ngrok_url'] ?? '')),
+    ];
+}
+
+function saveConfigFile(string $configPath, array $cfg): array {
+    $dir = dirname($configPath);
+    if (!is_dir($dir) || !is_writable($dir)) {
+        return [false, 'Folder repo tidak bisa ditulis. Pindahkan repo ke lokasi yang writable.'];
+    }
+    $content = "<?php\nreturn " . var_export($cfg, true) . ";\n";
+    $tempPath = $configPath . '.tmp';
+    if (file_put_contents($tempPath, $content, LOCK_EX) === false) {
+        return [false, 'Gagal menulis config sementara.'];
+    }
+    if (!@rename($tempPath, $configPath)) {
+        @unlink($tempPath);
+        return [false, 'Gagal mengganti config.php.'];
+    }
+    return [true, ''];
+}
+
+function detectRuntimeConfig(array $cfg): array {
+    if (($cfg['vscode_exe'] ?? '') === '') {
+        $cfg['vscode_exe'] = autoDetectPath([
+            getenv('ProgramFiles') ? getenv('ProgramFiles') . '\\Microsoft VS Code\\Code.exe' : '',
+            getenv('LOCALAPPDATA') ? getenv('LOCALAPPDATA') . '\\Programs\\Microsoft VS Code\\Code.exe' : '',
+            'C:\\Users\\' . get_current_user() . '\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe',
+        ]);
+    }
+    if (($cfg['ngrok_exe'] ?? '') === '') {
+        $cfg['ngrok_exe'] = autoDetectPath([
+            getenv('USERPROFILE') ? getenv('USERPROFILE') . '\\AppData\\Local\\ngrok\\ngrok.exe' : '',
+            getenv('USERPROFILE') ? getenv('USERPROFILE') . '\\AppData\\Roaming\\ngrok-v3-stable-windows-amd64\\ngrok.exe' : '',
+        ]);
+    }
+    if (($cfg['ngrok_config'] ?? '') === '') {
+        $possible = getenv('LOCALAPPDATA') ? getenv('LOCALAPPDATA') . '\\ngrok\\ngrok.yml' : '';
+        if ($possible !== '' && file_exists($possible)) {
+            $cfg['ngrok_config'] = $possible;
+        }
+    }
+    return $cfg;
+}
+
+if (isset($_POST['save_config'])) {
+    $newCfg = buildConfigPayload($_POST);
+    [$ok, $error] = saveConfigFile($configPath, $newCfg);
+    jsonResponse($ok ? ['success' => true] : ['success' => false, 'message' => $error]);
+}
+
+$cfg = $isConfigured ? $cfg : detectRuntimeConfig($cfg);
 $url = $cfg['ngrok_url'];
 $directory = $cfg['www_root'];
+if ($directory === '') $directory = $defaults['www_root'];
 
 // Fungsi untuk mendapatkan IP asli pengguna
 function getRealUserIP() {
@@ -80,13 +139,12 @@ if (isset($_POST['open_code'])) {
         $path = str_replace('/', '\\', $folder_path);
         $vscode = $cfg['vscode_exe'];
         if (empty($vscode) || !file_exists($vscode)) {
-            echo json_encode(['success' => false, 'message' => 'Path VS Code tidak valid. Atur di Settings.']);
-            exit;
+            jsonResponse(['success' => false, 'message' => 'Path VS Code tidak valid. Atur di Settings.']);
         }
-        $userProfile = getenv('USERPROFILE') ?: 'C:\Users\\' . get_current_user();
-        $command = "set USERPROFILE=$userProfile&& start \"\" \"$vscode\" \"$path\"";
+        $userProfile = getenv('USERPROFILE') ?: '';
+        $command = ($userProfile !== '' ? 'set "USERPROFILE=' . $userProfile . '"&& ' : '') . 'start "" "' . $vscode . '" "' . $path . '"';
         pclose(popen($command, "r"));
-        echo json_encode(['success' => true, 'message' => 'VS Code berhasil dibuka']);
+        jsonResponse(['success' => true, 'message' => 'VS Code berhasil dibuka']);
     } else {
         echo json_encode(['success' => false, 'message' => 'Direktori tidak ditemukan']);
     }
@@ -95,14 +153,11 @@ if (isset($_POST['open_code'])) {
 
 // Handle Get Active Tunnel
 if (isset($_POST['get_active_tunnel'])) {
-    header('Content-Type: application/json');
     $stateFile = __DIR__ . DIRECTORY_SEPARATOR . '.ngrok_active.json';
     if (file_exists($stateFile)) {
-        echo file_get_contents($stateFile);
-    } else {
-        echo json_encode(['active' => false]);
+        jsonResponse(json_decode((string) file_get_contents($stateFile), true) ?: ['active' => false]);
     }
-    exit;
+    jsonResponse(['active' => false]);
 }
 
 // Handle Kill Tunnel
@@ -208,7 +263,8 @@ if (isset($_POST['get_project_count'])) {
         body { font-family: 'Inter', sans-serif; background-color: var(--ink); background-image: radial-gradient(rgba(255,255,255,0.045) 1px, transparent 1px); background-size: 24px 24px; }
         .font-display { font-family: 'Space Grotesk', sans-serif; }
         .font-mono { font-family: 'JetBrains Mono', monospace; }
-        .config-input { @apply w-full bg-[var(--surface-soft)] border border-[var(--line)] rounded-md px-3 py-2 text-sm text-[var(--text)] outline-none focus:border-[var(--amber)] transition-colors; }
+        .config-input { width: 100%; background: var(--surface-soft); border: 1px solid var(--line); border-radius: 0.375rem; padding: 0.5rem 0.75rem; font-size: 0.875rem; color: var(--text); outline: none; }
+        .config-input:focus { border-color: var(--amber); }
     </style>
 </head>
 
@@ -226,6 +282,7 @@ if (isset($_POST['get_project_count'])) {
         </div>
 
         <form id="setupForm" class="space-y-5">
+            <input type="hidden" name="save_config" value="1">
             <div>
                 <label class="block text-xs font-bold uppercase tracking-wider text-[var(--faint)] mb-2">Laragon WWW Root</label>
                 <input type="text" name="www_root" value="<?php echo htmlspecialchars($cfg['www_root']); ?>" class="config-input" placeholder="C:\laragon\www">
@@ -263,12 +320,13 @@ if (isset($_POST['get_project_count'])) {
             btn.disabled = true;
             btn.innerText = 'Menyimpan...';
 
-            fetch('', { method: 'POST', body: new FormData(this) })
-            .then(r => r.json())
-            .then(d => {
-                if(d.success) window.location.reload();
-                else alert(d.message);
+            fetch(window.location.pathname, { method: 'POST', body: new FormData(this) })
+            .then(async r => ({ ok: r.ok, data: await r.json() }))
+            .then(({ data }) => {
+                if (data.success) window.location.reload();
+                else alert(data.message || 'Gagal menyimpan config');
             })
+            .catch(() => alert('Respons server tidak valid'))
             .finally(() => { btn.disabled = false; btn.innerText = 'Simpan & Mulai Dashboard'; });
         };
     </script>
@@ -424,8 +482,10 @@ if (isset($_POST['get_project_count'])) {
         
         document.getElementById('settingsForm').onsubmit = function(e) {
             e.preventDefault();
-            fetch('', { method: 'POST', body: new FormData(this) })
-            .then(r => r.json()).then(d => d.success ? window.location.reload() : alert(d.message));
+            fetch(window.location.pathname, { method: 'POST', body: new FormData(this) })
+            .then(async r => ({ ok: r.ok, data: await r.json() }))
+            .then(({ data }) => data.success ? window.location.reload() : alert(data.message || 'Gagal menyimpan config'))
+            .catch(() => alert('Respons server tidak valid'));
         };
 
         function showToast(msg, type = 'success') {
